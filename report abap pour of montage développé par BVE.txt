@@ -1,0 +1,232 @@
+*&---------------------------------------------------------------------*
+*& Report ZBVE_UTILS01_PLNORD_CREATION
+*&---------------------------------------------------------------------*
+*&
+*&---------------------------------------------------------------------*
+REPORT zbve_utils01_plnord_creation.
+
+**********************************************************************
+* CONSTANTS                                                            *
+************************************************************************
+CONSTANTS: c_s             VALUE 'S',
+           c_61(2)         VALUE '61',
+           c_010(3)        VALUE '010'.
+
+**********************************************************************
+* DATA                                                          *
+************************************************************************
+
+  DATA : ls_headerdata   LIKE bapiplaf_i1,
+        lt_return        LIKE TABLE OF bapireturn1 WITH HEADER LINE,
+         lt_commit_return LIKE TABLE OF bapiret2 WITH HEADER LINE,
+         l_plannedorder  LIKE bapi_pldord-pldord_num,
+         l_productionorder LIKE bapi_order_copy-order_number,
+
+         BEGIN OF it_pld_order OCCURS 0,
+            li_plannedorder LIKE bapi_pldord-pldord_num,
+         END OF it_pld_order,
+
+         BEGIN OF it_prd_order OCCURS 0,
+            li_prd_order LIKE AUFK-AUFNR,
+         END OF it_prd_order.
+
+
+    DATA : lt_comdata LIKE TABLE OF bapi_pldordcomp_i1 WITH HEADER LINE,
+           l_serial_commit TYPE C,
+           ls_serial TYPE C LENGTH 18,
+           l_sernos LIKE E1RMSNO occurs 0.
+
+    DATA:  it_zqm_matmodt TYPE STANDARD TABLE OF ZQM_MATMODT WITH DEFAULT KEY,
+           lv_zqm_Z_refart_matmodt TYPE zqm_matmodt-z_refart.
+
+
+
+**********************************************************************
+* PARAMETERS                                                            *
+************************************************************************
+
+    PARAMETERS material TYPE matnr.
+    PARAMETERS plant TYPE werks_d.
+    PARAMETERS stor_loc TYPE lgort_d.
+    PARAMETERS version TYPE berid.
+    PARAMETERS unit_num TYPE sernr.
+    PARAMETERS serial TYPE GERNR.
+
+**  To be activated: Si l'on souhaite créer en masse mais trouver un moyen de renseigner
+**   aussi une liste de numéro de série
+*   PARAMETERS multiple TYPE i.
+
+    ls_headerdata-material = material.
+    ls_headerdata-plan_plant = plant.
+    ls_headerdata-prod_plant = plant.
+    ls_headerdata-pldord_profile = 'LA'.
+    ls_headerdata-total_plord_qty = 1.
+    ls_headerdata-order_start_date = sy-datum.
+    ls_headerdata-order_fin_date = sy-datum+1.
+    ls_headerdata-version = version.
+    ls_headerdata-stge_loc = stor_loc.
+    ls_headerdata-bomexpl_no = unit_num.
+    ls_headerdata-conversion_ind = 'X'.
+    ls_headerdata-firming_ind = 'X'.
+    ls_serial = serial.
+
+
+    CLEAR lt_return.
+    REFRESH lt_return.
+    CLEAR lt_commit_return.
+    REFRESH lt_commit_return.
+    CLEAR l_plannedorder.
+
+*    Multiple reste fixé à 1 tant que l'algo ne prévoit pas décla multiple de SN
+    DATA(multiple) = 1.
+    IF multiple < 0 OR multiple > 3.
+        MESSAGE e001(00) WITH 'Le champ "Multiple" doit être compris entre 0 et 3.'.
+        RETURN.
+    ENDIF.
+
+
+    WHILE multiple > 0.
+
+*       Nettoyage des et numéros
+        CLEAR: lt_return, lt_commit_return, l_plannedorder, l_productionorder.
+
+*        Create planned order
+            CALL FUNCTION 'BAPI_PLANNEDORDER_CREATE'
+                 EXPORTING
+                      headerdata     = ls_headerdata
+                 IMPORTING
+                      return         = lt_return
+                      plannedorder   = l_plannedorder
+                 TABLES
+                      componentsdata = lt_comdata.
+
+*               If create was successfully insert into the list of planned order to commit dem all
+                IF lt_return-type = c_s AND lt_return-id   = c_61 AND lt_return-number = c_010.
+                  WRITE: lt_return-message.
+                  APPEND l_plannedorder TO it_pld_order.
+                ELSEIF lt_return IS NOT INITIAL.
+                    WRITE: lt_return-message.
+                    RETURN.
+                ELSE.
+                    WRITE: /'La sauvegarde du Plnd Order a échoué - Vérifiez tout de même dans la Plaf'.
+                    RETURN.
+                ENDIF.
+
+           multiple = multiple - 1.
+   ENDWHILE.
+
+**********************************************************************
+*Commit All Pld Orders created to limit
+**********************************************************************
+   CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+            wait = 'X'
+       IMPORTING
+            return = lt_commit_return.
+
+  IF lt_commit_return-message IS NOT INITIAL.
+    WRITE: lt_commit_return-message.
+  ENDIF.
+  IF SY-SUBRC IS NOT INITIAL.
+    RETURN.
+  ENDIF.
+
+**********************************************************************
+* Conversion of Planed Orders to Production Orders
+**********************************************************************
+
+  LOOP AT it_pld_order INTO DATA(wl_pldorder).
+    CALL FUNCTION 'BAPI_PRODORD_CREATE_FROM_PLORD'
+                    EXPORTING
+                        planned_order = wl_pldorder
+                        order_type = 'ZMON'
+                    IMPORTING
+                        production_order = l_productionorder.
+                IF SY-subrc = 0 AND l_productionorder IS NOT INITIAL.
+                    WRITE: l_productionorder, 'has been created'.
+                    APPEND l_productionorder TO it_prd_order.
+                ELSE.
+                    WRITE: 'La conversion du planned order en Prod. Order a echoué'.
+                    RETURN.
+                ENDIF.
+  ENDLOOP.
+
+***********************************************************************
+* Assigning the serial number to ProdOrder
+**********************************************************************
+
+*  Prévoir une boucle pour y insérer les SN lors de créa multiple
+    DATA: materialprod LIKE RISA0-MATNR.
+    MOVE ls_headerdata-material TO materialprod.
+    APPEND VALUE #( SERNR = ls_serial ) to l_sernos.
+    LOOP AT it_prd_order INTO DATA(wl_prdorder).
+     CALL FUNCTION 'SERNR_ADD_TO_PP'
+        EXPORTING
+            PROFILE = 'ZENG'
+            MATERIAL = materialprod
+            QUANTITY = 1
+            PPAUFNR = wl_prdorder-li_prd_order
+            PPPOSNR = '1'
+            PPAUTYP = '10'
+            PPAUFART = 'ZMON'
+            PMRSORD = ''
+            PPWERK = ls_headerdata-prod_plant
+         IMPORTING
+            SERIAL_COMMIT = l_serial_commit
+         TABLES
+            SERNOS = l_sernos.
+    ENDLOOP.
+
+    IF SY-subrc <> 0.
+        WRITE: / |Problème à la génération du ou des SNs|.
+        RETURN.
+    ENDIF.
+
+*   Kind of commit for SN in Prod Order
+    CALL FUNCTION 'SERIAL_LISTE_POST_PP'.
+    IF SY-subrc <> 0.
+        WRITE: / |Problème à l'assignation du / des SNs|.
+        RETURN.
+    ENDIF.
+
+**********************************************************************
+* Commit Assigning OF SN in DB
+**********************************************************************
+   CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+           wait = 'X'
+       IMPORTING
+           return = lt_commit_return.
+
+  IF SY-SUBRC IS NOT INITIAL.
+    RETURN.
+   ENDIF.
+  WRITE: lt_commit_return-message.
+
+
+  LOOP AT l_sernos INTO DATA(w_sernos_msg).
+    WRITE: / |SN assigné à l'ordre: |, w_sernos_msg-sernr.
+  ENDLOOP.
+
+* Uniquement pour éviter un dump de typage
+* -->lv_zqm_Z_refart_matmodt a le type attendu dans la table
+  MOVE ls_headerdata-material TO lv_zqm_Z_refart_matmodt.
+
+  LOOP AT l_sernos INTO DATA(w_qm_serial).
+    APPEND VALUE #(
+        MANDT = SY-mandt
+        Z_NUMMAT = w_qm_serial
+        Z_REFART = lv_zqm_Z_refart_matmodt
+        Z_PRGMMOT = 'M88'
+        Z_STATE = '01'
+        Z_NUMUNIT = ls_headerdata-bomexpl_no
+    ) to it_zqm_matmodt.
+  ENDLOOP.
+
+  INSERT ZQM_MATMODT FROM TABLE it_zqm_matmodt.
+  IF SY-SUBRC <> 0.
+    RETURN.
+  ENDIF.
+  COMMIT WORK.
+
+  WRITE: / |Le ou les SN ont été ajouté à la table ZQM_MATMODT'|.
